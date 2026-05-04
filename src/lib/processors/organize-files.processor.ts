@@ -353,6 +353,72 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
       errorMessage.includes('EPERM');    // Operation not permitted (might be temporary)
 
     if (isRetryableError) {
+      // Blocklist the release if it failed due to wrong content type (not transient filesystem errors)
+      const isWrongContentError =
+        errorMessage.includes('No audiobook files found') ||
+        errorMessage.includes('No ebook files found');
+
+      if (isWrongContentError) {
+        try {
+          const dlHistory = await prisma.downloadHistory.findFirst({
+            where: { requestId, selected: true },
+            orderBy: { createdAt: 'desc' },
+            select: { torrentName: true, indexerName: true, indexerId: true },
+          });
+
+          if (dlHistory?.torrentName) {
+            // Check if already blocklisted to avoid duplicates
+            const existing = await prisma.blockedRelease.findFirst({
+              where: { releaseName: dlHistory.torrentName },
+            });
+
+            if (!existing) {
+              await prisma.blockedRelease.create({
+                data: {
+                  requestId,
+                  audiobookId,
+                  releaseName: dlHistory.torrentName,
+                  indexerName: dlHistory.indexerName,
+                  indexerId: dlHistory.indexerId,
+                  reason: errorMessage,
+                },
+              });
+              logger.info(`Blocklisted release: "${dlHistory.torrentName}" (${errorMessage})`);
+            }
+          }
+        } catch (blockError) {
+          logger.warn(`Failed to blocklist release: ${blockError instanceof Error ? blockError.message : String(blockError)}`);
+        }
+      }
+
+
+      // Wrong content type (e.g., epub instead of audiobook) - skip re-import retry
+      // and queue for re-search so the blocklist filters out the bad release
+      if (isWrongContentError) {
+        logger.info(`Wrong content type for request ${requestId}, queueing for re-search (blocklisted release will be skipped)`);
+
+        await prisma.request.update({
+          where: { id: requestId },
+          data: {
+            status: 'awaiting_search',
+            errorMessage: `${errorMessage}. Release blocklisted, queued for re-search.`,
+            updatedAt: new Date(),
+          },
+        });
+
+        // Deselect the failed download so it does not interfere with future downloads
+        await prisma.downloadHistory.updateMany({
+          where: { requestId, selected: true },
+          data: { selected: false },
+        });
+
+        return {
+          success: false,
+          message: 'Wrong content type, release blocklisted and queued for re-search',
+          requestId,
+        };
+      }
+
       // Get current request to check retry count
       const currentRequest = await prisma.request.findFirst({
         where: {

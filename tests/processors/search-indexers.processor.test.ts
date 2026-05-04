@@ -35,6 +35,7 @@ vi.mock('@/lib/integrations/audible.service', () => ({
 describe('processSearchIndexers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    prismaMock.blockedRelease.findMany.mockResolvedValue([]);
     configMock.getAudibleRegion.mockResolvedValue('us');
   });
 

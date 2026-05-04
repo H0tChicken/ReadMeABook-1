@@ -113,7 +113,7 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
       }
     }
 
-    const searchResults = allResults;
+    let searchResults = allResults;
     logger.info(`Found ${searchResults.length} total results from ${groups.length} group${groups.length > 1 ? 's' : ''}`);
 
     if (searchResults.length === 0) {
@@ -157,6 +157,22 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
     const belowThreshold = searchResults.filter(r => (r.size / (1024 * 1024)) < sizeMBThreshold);
     if (belowThreshold.length > 0) {
       logger.info(`Will filter ${belowThreshold.length} results < ${sizeMBThreshold} MB (likely ebooks)`);
+    }
+
+    // Filter out blocklisted releases (previously failed downloads)
+    const blockedReleases = await prisma.blockedRelease.findMany({
+      where: { audiobookId: audiobook.id },
+      select: { releaseName: true },
+    });
+
+    if (blockedReleases.length > 0) {
+      const blockedNames = new Set(blockedReleases.map(b => b.releaseName));
+      const beforeBlocklist = searchResults.length;
+      searchResults = searchResults.filter(r => !blockedNames.has(r.title));
+      const blockedCount = beforeBlocklist - searchResults.length;
+      if (blockedCount > 0) {
+        logger.info(`Filtered out ${blockedCount} blocklisted release(s)`);
+      }
     }
 
     // Get ranking algorithm and language-specific stop words

@@ -202,8 +202,16 @@ describe('processOrganizeFiles', () => {
     );
   });
 
-  it('queues retry when a retryable error occurs', async () => {
+  it('queues re-search when wrong content type detected', async () => {
     prismaMock.request.update.mockResolvedValue({});
+    prismaMock.downloadHistory.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.downloadHistory.findFirst.mockResolvedValue({
+      torrentName: 'Bad NZB Title',
+      indexerName: 'TestIndexer',
+      indexerId: 1,
+    });
+    prismaMock.blockedRelease.findFirst.mockResolvedValue(null);
+    prismaMock.blockedRelease.create.mockResolvedValue({});
     prismaMock.audiobook.findUnique.mockResolvedValue({
       id: 'a2',
       title: 'Book',
@@ -218,11 +226,6 @@ describe('processOrganizeFiles', () => {
       filesMovedCount: 0,
       errors: ['No audiobook files found in download'],
       audioFiles: [],
-    });
-    prismaMock.request.findFirst.mockResolvedValue({
-      importAttempts: 0,
-      maxImportRetries: 3,
-      deletedAt: null,
     });
     configMock.get.mockImplementation(async (key: string) => {
       if (key === 'audiobook_path_template') return '{author}/{title} {asin}';
@@ -240,9 +243,10 @@ describe('processOrganizeFiles', () => {
     expect(result.success).toBe(false);
     expect(prismaMock.request.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ status: 'awaiting_import' }),
+        data: expect.objectContaining({ status: 'awaiting_search' }),
       })
     );
+    expect(prismaMock.blockedRelease.create).toHaveBeenCalled();
   });
 
   it('marks request as warn when max retries exceeded and notifies user', async () => {
@@ -259,7 +263,7 @@ describe('processOrganizeFiles', () => {
       success: false,
       targetPath: '',
       filesMovedCount: 0,
-      errors: ['No audiobook files found in download'],
+      errors: ['ENOENT: no such file or directory'],
       audioFiles: [],
     });
     prismaMock.request.findFirst.mockResolvedValue({

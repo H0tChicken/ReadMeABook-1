@@ -765,3 +765,25 @@ model DataMigration {
 
   @@map("_data_migrations")
 }
+
+// ============================================================================
+// BLOCKED RELEASES TABLE
+// Tracks releases that failed during file organization (e.g., epub downloaded
+// instead of audiobook). Blocked releases are excluded from future search results
+// to prevent duplicate re-downloads.
+// ============================================================================
+
+model BlockedRelease {
+  id          String   @id @default(uuid())
+  requestId   String?  @map("request_id") // Which request triggered the block (nullable for manual blocks)
+  audiobookId String?  @map("audiobook_id") // Which audiobook this block is for
+  releaseName String   @map("release_name") // torrent/NZB name (from download_history.torrent_name)
+  indexerName String?  @map("indexer_name") // Prowlarr indexer name
+  indexerId   Int?     @map("indexer_id") // Prowlarr indexer ID
+  reason      String   @db.Text // Why it was blocked (e.g., "No audiobook files found in download")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([releaseName])
+  @@index([audiobookId])
+  @@map("blocked_releases")
+}

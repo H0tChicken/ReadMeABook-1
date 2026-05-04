@@ -109,6 +109,17 @@ PostgreSQL database storing users, audiobooks, requests, downloads, configuratio
 - Indexes: `job_id`, `created_at`
 - **Purpose:** Store detailed event logs for job operations (shown in admin logs UI)
 
+
+### Blocked_Releases
+- `id` (UUID PK), `request_id` (FK nullable), `audiobook_id` (nullable)
+- `release_name` — NZB/torrent name (from download_history.torrent_name)
+- `indexer_name` (nullable), `indexer_id` (nullable) — Prowlarr indexer info
+- `reason` (text) — error message that triggered the block
+- `created_at`
+- Indexes: `release_name`, `audiobook_id`
+- **Purpose:** Tracks releases that failed file organization (wrong content type). Excluded from future search results to prevent duplicate re-downloads.
+- **Documentation:** [features/release-blocklist.md](../features/release-blocklist.md)
+
 ## Relationships
 
 - User → Requests (1:many)

@@ -108,6 +108,12 @@
 - **File hash-based library matching (ABS)** → [fixes/file-hash-matching.md](fixes/file-hash-matching.md)
 - **Accurate ASIN matching for RMAB-organized content** → [fixes/file-hash-matching.md](fixes/file-hash-matching.md)
 
+
+## Release Blocklist
+- **Auto-blocklist failed releases, prevent duplicate downloads** → [features/release-blocklist.md](features/release-blocklist.md)
+- **Blocklist admin API (view, clear, remove)** → [features/release-blocklist.md](features/release-blocklist.md)
+- **Wrong content re-search flow** → [features/release-blocklist.md](features/release-blocklist.md)
+
 ## Deployment
 - **Docker Compose setup (multi-container)** → [deployment/docker.md](deployment/docker.md)
 - **Unified container (all-in-one)** → [deployment/unified.md](deployment/unified.md)
