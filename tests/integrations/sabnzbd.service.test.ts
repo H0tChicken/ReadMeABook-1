@@ -302,6 +302,36 @@ describe('SABnzbdService', () => {
     expect(info?.completedAt?.getTime()).toBe(1700000000 * 1000);
   });
 
+  it('treats unrecognized SABnzbd history status as failed', async () => {
+    clientMock.get
+      .mockResolvedValueOnce({ data: { queue: { slots: [] } } })
+      .mockResolvedValueOnce({
+        data: {
+          history: {
+            slots: [
+              {
+                nzo_id: 'nzb-weird',
+                name: 'Stuck Book',
+                category: 'readmeabook',
+                status: 'Unknown', // not Completed or Failed
+                bytes: '1024',
+                fail_message: '',
+                storage: '/downloads/book',
+                completed: '1700000005',
+                download_time: '30',
+              },
+            ],
+          },
+        },
+      });
+
+    const service = new SABnzbdService('http://sab', 'key');
+    const info = await service.getNZB('nzb-weird');
+
+    expect(info?.status).toBe('failed');
+    expect(info?.errorMessage).toMatch(/Unrecognized SABnzbd history status/);
+  });
+
   it('returns history item info when NZB has failed', async () => {
     clientMock.get
       .mockResolvedValueOnce({ data: { queue: { slots: [] } } })
@@ -811,6 +841,74 @@ describe('SABnzbdService', () => {
       expect(setCategoryCall).toBeDefined();
       // Path should be empty since /downloads maps to D:\Usenet\Complete which matches complete_dir
       expect(setCategoryCall![1].params.dir).toBe('');
+    });
+  });
+
+  describe('deleteFromHistory', () => {
+    it('permanently deletes failed NZB and removes files', async () => {
+      clientMock.get.mockResolvedValueOnce({ data: { status: true } });
+
+      const service = new SABnzbdService('http://sab', 'key');
+      await service.deleteFromHistory('nzb-failed', true);
+
+      expect(clientMock.get).toHaveBeenCalledWith(
+        '/api',
+        expect.objectContaining({
+          params: expect.objectContaining({
+            mode: 'history',
+            name: 'delete',
+            value: 'nzb-failed',
+            del_files: '1',
+            archive: '0',
+          }),
+        })
+      );
+    });
+
+    it('throws when SABnzbd returns an error response', async () => {
+      clientMock.get.mockResolvedValueOnce({ data: { status: false, error: 'NZB not found' } });
+
+      const service = new SABnzbdService('http://sab', 'key');
+      await expect(service.deleteFromHistory('missing')).rejects.toThrow(/NZB not found/);
+    });
+  });
+
+  describe('deleteDownload (unified interface)', () => {
+    it('deletes from queue when NZB is still in queue', async () => {
+      // First call: getQueue
+      clientMock.get
+        .mockResolvedValueOnce({
+          data: { queue: { slots: [{ nzo_id: 'nzb-active', filename: 'x', mb: '0', mbleft: '0', percentage: '0', status: 'Downloading', timeleft: '0:00:00' }] } },
+        })
+        // Second call: queue delete
+        .mockResolvedValueOnce({ data: { status: true } });
+
+      const service = new SABnzbdService('http://sab', 'key');
+      await service.deleteDownload('nzb-active', true);
+
+      const queueDeleteCall = clientMock.get.mock.calls.find(
+        (call) => call[1]?.params?.mode === 'queue' && call[1]?.params?.name === 'delete'
+      );
+      expect(queueDeleteCall).toBeDefined();
+      expect(queueDeleteCall![1].params.value).toBe('nzb-active');
+    });
+
+    it('falls back to history delete when NZB is not in queue (e.g., par2-failed)', async () => {
+      clientMock.get
+        // getQueue: empty
+        .mockResolvedValueOnce({ data: { queue: { slots: [] } } })
+        // history delete
+        .mockResolvedValueOnce({ data: { status: true } });
+
+      const service = new SABnzbdService('http://sab', 'key');
+      await service.deleteDownload('nzb-failed', true);
+
+      const historyDeleteCall = clientMock.get.mock.calls.find(
+        (call) => call[1]?.params?.mode === 'history' && call[1]?.params?.name === 'delete'
+      );
+      expect(historyDeleteCall).toBeDefined();
+      expect(historyDeleteCall![1].params.value).toBe('nzb-failed');
+      expect(historyDeleteCall![1].params.archive).toBe('0');
     });
   });
 });

@@ -40,10 +40,10 @@ Manages background job queue using Bull (Redis-backed) for async tasks: searchin
 - Retry logic: 3 attempts with exponential backoff (500ms, 1s, 2s) for getTorrent failures
 - Transient error handling: "torrent not found" errors don't mark request as failed during retries
 - Request stays in "downloading" status during all retry attempts
-- Only marks request as "failed" after all Bull retries (3 attempts) exhausted
 - 10s delay between checks (prevents excessive logging)
 - Only logs progress at 5% intervals or first 5%
 - Auto-reschedules until complete/failed
+- **On client-reported `failed` (par2 short, aborted, errored):** delete from client (with files), blocklist the release, deselect download_history, set request → `awaiting_search` (so retry-missing-torrents picks it up and search filters the bad release). After `MAX_DOWNLOAD_ATTEMPTS = 5` attempts, give up and mark request `failed` permanently. See [release-blocklist.md](../../features/release-blocklist.md).
 
 **search_indexers:**
 - No torrents found → 'awaiting_search' status (not failed)

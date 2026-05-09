@@ -10,7 +10,16 @@ import { getRankingAlgorithm } from '../utils/ranking-algorithm';
 import { groupIndexersByCategories, getGroupDescription } from '../utils/indexer-grouping';
 import { RMABLogger } from '../utils/logger';
 import { getLanguageForRegion } from '../constants/language-config';
+import { normalizeReleaseName } from '../utils/release-name';
 import type { AudibleRegion } from '../types/audible';
+
+/**
+ * Maximum search attempts before giving up on a request. Bounds the
+ * blocklist re-search loop: if every available result is blocklisted (or
+ * no result clears the quality threshold), the request would otherwise
+ * cycle between `awaiting_search` and `searching` indefinitely.
+ */
+const MAX_SEARCH_ATTEMPTS = 20;
 
 /**
  * Process search indexers job
@@ -24,6 +33,54 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
   logger.info(`Processing request ${requestId} for "${audiobook.title}"`);
 
   try {
+    // Cap the re-search loop. If `searchAttempts` is already at the cap, the
+    // request has been retried 20 times without producing a downloadable
+    // result — give up rather than churning forever.
+    const currentRequest = await prisma.request.findUnique({
+      where: { id: requestId },
+      select: { searchAttempts: true },
+    });
+    if ((currentRequest?.searchAttempts ?? 0) >= MAX_SEARCH_ATTEMPTS) {
+      const failureMessage = `No downloadable release found after ${MAX_SEARCH_ATTEMPTS} search attempts. Clear the blocklist or adjust indexers/quality thresholds, then retry.`;
+      logger.error(`Request ${requestId} exceeded MAX_SEARCH_ATTEMPTS, marking failed`);
+
+      await prisma.request.update({
+        where: { id: requestId },
+        data: {
+          status: 'failed',
+          errorMessage: failureMessage,
+          updatedAt: new Date(),
+        },
+      });
+
+      const requestForNotify = await prisma.request.findUnique({
+        where: { id: requestId },
+        include: {
+          audiobook: true,
+          user: { select: { plexUsername: true } },
+        },
+      });
+      if (requestForNotify) {
+        const jobQueue = getJobQueueService();
+        await jobQueue.addNotificationJob(
+          'request_error',
+          requestForNotify.id,
+          requestForNotify.audiobook.title,
+          requestForNotify.audiobook.author,
+          requestForNotify.user.plexUsername || 'Unknown User',
+          failureMessage
+        ).catch((err) => {
+          logger.error('Failed to queue notification', { error: err instanceof Error ? err.message : String(err) });
+        });
+      }
+
+      return {
+        success: false,
+        message: failureMessage,
+        requestId,
+      };
+    }
+
     // Update request status to searching
     await prisma.request.update({
       where: { id: requestId },
@@ -159,16 +216,19 @@ export async function processSearchIndexers(payload: SearchIndexersPayload): Pro
       logger.info(`Will filter ${belowThreshold.length} results < ${sizeMBThreshold} MB (likely ebooks)`);
     }
 
-    // Filter out blocklisted releases (previously failed downloads)
+    // Filter out blocklisted releases (previously failed downloads).
+    // Compare on a normalized form (lowercase, alphanumeric-only) so cosmetic
+    // variations between indexers — different separators, parens, file
+    // extensions — don't let an already-failed release slip through.
     const blockedReleases = await prisma.blockedRelease.findMany({
       where: { audiobookId: audiobook.id },
       select: { releaseName: true },
     });
 
     if (blockedReleases.length > 0) {
-      const blockedNames = new Set(blockedReleases.map(b => b.releaseName));
+      const blockedNames = new Set(blockedReleases.map(b => normalizeReleaseName(b.releaseName)));
       const beforeBlocklist = searchResults.length;
-      searchResults = searchResults.filter(r => !blockedNames.has(r.title));
+      searchResults = searchResults.filter(r => !blockedNames.has(normalizeReleaseName(r.title)));
       const blockedCount = beforeBlocklist - searchResults.length;
       if (blockedCount > 0) {
         logger.info(`Filtered out ${blockedCount} blocklisted release(s)`);

@@ -26,8 +26,8 @@ Free, open-source Usenet/NZB download client with comprehensive Web API. Industr
 **GET /api?mode=resume&value={nzbId}&output=json&apikey={key}** - Resume download
 **GET /api?mode=queue&name=delete&value={nzbId}&del_files={0|1}&output=json&apikey={key}** - Delete download from queue
 **GET /api?mode=history&name=delete&value={nzbId}&del_files={0|1}&archive={0|1}&output=json&apikey={key}** - Delete/archive download from history
-  - `archive=1` (default): Move to hidden archive (preserves for troubleshooting)
-  - `archive=0`: Permanently delete from history
+  - `archive=1`: Move to hidden archive (preserves for troubleshooting) — used after a successful download (`archiveCompletedNZB`)
+  - `archive=0` + `del_files=1`: Permanently delete from history and disk — used when a download fails (`deleteFromHistory`) so the SAB UI doesn't accumulate dead par2-failed entries
 **GET /api?mode=get_config&output=json&apikey={key}** - Get configuration (categories)
 **GET /api?mode=set_config&section=categories&keyword={cat}&value={path}&output=json&apikey={key}** - Create/update category
 
@@ -223,6 +223,19 @@ organizePath = PathMapper.transform(sabPath, config)
 ```
 
 **Implementation:** Uses `PathMapper` utility (same as qBittorrent)
+
+## Failed Download Cleanup
+
+**Trigger:** Monitor-download processor sees an NZB with status `failed` (par2 short, aborted, etc.).
+
+**Behavior:**
+- Calls unified `client.deleteDownload(nzbId, deleteFiles=true)`
+- Unified delete tries the queue first; if the NZB is no longer in queue (typical for par2-failed items already moved to history), falls back to `deleteFromHistory(nzbId, deleteFiles=true)` (`archive=0`)
+- Permanent delete (not archive) — the `blocked_releases` table is the durable record of "don't retry this release"
+- Files on disk are removed (`del_files=1`)
+- Errors during delete are logged as warnings; the rest of the failed-handling flow (blocklist + re-search) still proceeds
+
+See [release-blocklist.md](../features/release-blocklist.md) for the surrounding flow.
 
 ## Fixed Issues ✅
 

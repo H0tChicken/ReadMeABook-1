@@ -725,6 +725,33 @@ export class SABnzbdService implements IDownloadClient {
   }
 
   /**
+   * Permanently delete NZB from history (and optionally remove its files from disk).
+   * Used to clean up failed downloads — they have no recovery value and the blocklist
+   * is the durable record of "don't retry this release".
+   */
+  async deleteFromHistory(nzbId: string, deleteFiles: boolean = true): Promise<void> {
+    logger.info(`Permanently deleting NZB from history: ${nzbId} (del_files: ${deleteFiles ? '1' : '0'})`);
+
+    const response = await this.client.get('/api', {
+      params: {
+        mode: 'history',
+        name: 'delete',
+        value: nzbId,
+        del_files: deleteFiles ? '1' : '0',
+        archive: '0', // Permanent delete (not archive)
+        output: 'json',
+        apikey: this.apiKey,
+      },
+    });
+
+    logger.info(`SABnzbd history delete response: ${JSON.stringify(response.data)}`);
+
+    if (response.data?.status === false) {
+      throw new Error(response.data.error || `Failed to delete NZB ${nzbId} from history`);
+    }
+  }
+
+  /**
    * Archive NZB from history (hides from main view but preserves for troubleshooting)
    * Note: SABnzbd's default behavior is to archive. Use archive=0 to permanently delete.
    */
@@ -816,9 +843,22 @@ export class SABnzbdService implements IDownloadClient {
     return this.resumeNZB(id);
   }
 
-  /** Delete a download via the unified interface */
+  /**
+   * Delete a download via the unified interface.
+   *
+   * Tries the queue first; if the NZB has already moved to history (e.g. after
+   * a par2-failed download), falls back to a permanent history delete so the
+   * SABnzbd UI doesn't accumulate dead entries.
+   */
   async deleteDownload(id: string, deleteFiles: boolean = false): Promise<void> {
-    return this.deleteNZB(id, deleteFiles);
+    const queue = await this.getQueue();
+    const inQueue = queue.some(item => item.nzbId === id);
+
+    if (inQueue) {
+      return this.deleteNZB(id, deleteFiles);
+    }
+
+    return this.deleteFromHistory(id, deleteFiles);
   }
 
   /**
@@ -948,23 +988,49 @@ export class SABnzbdService implements IDownloadClient {
 
   /**
    * Map history item to NZBInfo
+   *
+   * SABnzbd history items are normally terminal (Completed or Failed). If we
+   * see something else here (a status string SAB introduces in a future
+   * version, or a transient post-processing state that lingers), treat it as
+   * `failed` rather than `downloading`. Returning `downloading` would loop
+   * the monitor indefinitely on an item that's actually done; routing it
+   * through the failure flow surfaces it to the user, deletes the dead
+   * history entry, and re-searches.
    */
   private mapHistoryItemToNZBInfo(historyItem: HistoryItem): NZBInfo {
-    const isCompleted = historyItem.status.toLowerCase().includes('completed');
-    const isFailed = historyItem.status.toLowerCase().includes('failed');
+    const statusLower = historyItem.status.toLowerCase();
+    const isCompleted = statusLower.includes('completed');
+    const isFailed = statusLower.includes('failed');
+
+    let status: NZBStatus;
+    let errorMessage: string | undefined = historyItem.failMessage || undefined;
+
+    if (isCompleted) {
+      status = 'completed';
+    } else if (isFailed) {
+      status = 'failed';
+    } else {
+      logger.warn(`Unrecognized SABnzbd history status, treating as failed`, {
+        nzbId: historyItem.nzbId,
+        name: historyItem.name,
+        status: historyItem.status,
+      });
+      status = 'failed';
+      errorMessage = errorMessage || `Unrecognized SABnzbd history status: ${historyItem.status}`;
+    }
 
     return {
       nzbId: historyItem.nzbId,
       name: historyItem.name,
       size: parseInt(historyItem.bytes || '0', 10),
       progress: isCompleted ? 1.0 : 0.0,
-      status: isFailed ? 'failed' : isCompleted ? 'completed' : 'downloading',
+      status,
       downloadSpeed: 0,
       timeLeft: 0,
       category: historyItem.category,
       downloadPath: historyItem.storage,
       completedAt: historyItem.completedTimestamp ? new Date(parseInt(historyItem.completedTimestamp) * 1000) : undefined,
-      errorMessage: historyItem.failMessage || undefined,
+      errorMessage,
     };
   }
 

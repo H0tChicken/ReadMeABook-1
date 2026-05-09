@@ -36,6 +36,7 @@ export async function processDownloadTorrent(payload: DownloadTorrentPayload): P
       data: {
         status: 'downloading',
         progress: 0,
+        downloadAttempts: { increment: 1 },
         updatedAt: new Date(),
       },
     });

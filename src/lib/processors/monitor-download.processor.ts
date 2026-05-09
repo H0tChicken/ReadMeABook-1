@@ -27,6 +27,13 @@ const MAX_POLL_INTERVAL = 300;
  * enough to survive a Docker restart, service update, or transient network outage.
  */
 const MAX_CONNECTION_FAILURES = 30;
+/**
+ * Maximum download attempts (per request) before giving up and marking the request
+ * permanently failed. Each cycle: search → download → fail (par2/aborted/etc.) →
+ * blocklist release → re-search → next download. This bounds the loop so a
+ * pathological release set (every result is bad) doesn't churn forever.
+ */
+const MAX_DOWNLOAD_ATTEMPTS = 5;
 
 /**
  * Compute next poll delay with exponential backoff for stalled downloads.
@@ -194,30 +201,38 @@ export async function processMonitorDownload(payload: MonitorDownloadPayload): P
         downloadPath: organizePath,
       };
     } else if (progressState === 'failed') {
-      logger.error(`Download failed for request ${requestId}`);
+      const clientErrorDetail = info.errorMessage ? `: ${info.errorMessage}` : '';
+      const errorMessage = `Download failed in ${client.clientType}${clientErrorDetail}`;
+      logger.error(`Download failed for request ${requestId}${clientErrorDetail}`);
 
-      const errorMessage = `Download failed in ${client.clientType}`;
-
-      // Update request to failed
-      await prisma.request.update({
-        where: { id: requestId },
-        data: {
-          status: 'failed',
-          errorMessage,
-          updatedAt: new Date(),
-        },
-      });
-
-      // Update download history
+      // Update download history immediately (record-of-truth for what failed)
       await prisma.downloadHistory.update({
         where: { id: downloadHistoryId },
         data: {
           downloadStatus: 'failed',
           downloadError: errorMessage,
+          selected: false, // free this slot so re-search can pick a new release
         },
       });
 
-      // Send notification for request failure
+      // Delete the failed download from the client. For SABnzbd, this falls back
+      // to a permanent history delete (with files) when the NZB has already moved
+      // out of the queue — so par2-failed entries don't pile up in the SAB UI.
+      try {
+        await client.deleteDownload(downloadClientId, /*deleteFiles=*/ true);
+        logger.info(`Removed failed download from ${client.clientType}: ${downloadClientId}`);
+      } catch (deleteError) {
+        logger.warn(`Failed to remove failed download from ${client.clientType}`, {
+          error: deleteError instanceof Error ? deleteError.message : String(deleteError),
+        });
+      }
+
+      // Look up release context for the blocklist + retry decision
+      const dlHistory = await prisma.downloadHistory.findUnique({
+        where: { id: downloadHistoryId },
+        select: { torrentName: true, indexerName: true, indexerId: true },
+      });
+
       const request = await prisma.request.findUnique({
         where: { id: requestId },
         include: {
@@ -226,24 +241,92 @@ export async function processMonitorDownload(payload: MonitorDownloadPayload): P
         },
       });
 
-      if (request) {
-        const jobQueue = getJobQueueService();
-        await jobQueue.addNotificationJob(
-          'request_error',
-          request.id,
-          request.audiobook.title,
-          request.audiobook.author,
-          request.user.plexUsername || 'Unknown User',
-          errorMessage
-        ).catch((error) => {
-          logger.error('Failed to queue notification', { error: error instanceof Error ? error.message : String(error) });
-        });
+      // Blocklist the failed release so future searches skip it
+      if (dlHistory?.torrentName && request?.audiobookId) {
+        try {
+          const existing = await prisma.blockedRelease.findFirst({
+            where: { releaseName: dlHistory.torrentName, audiobookId: request.audiobookId },
+          });
+          if (!existing) {
+            await prisma.blockedRelease.create({
+              data: {
+                requestId,
+                audiobookId: request.audiobookId,
+                releaseName: dlHistory.torrentName,
+                indexerName: dlHistory.indexerName,
+                indexerId: dlHistory.indexerId,
+                reason: errorMessage,
+              },
+            });
+            logger.info(`Blocklisted release: "${dlHistory.torrentName}" (${errorMessage})`);
+          }
+        } catch (blockError) {
+          logger.warn(`Failed to blocklist release`, {
+            error: blockError instanceof Error ? blockError.message : String(blockError),
+          });
+        }
       }
+
+      // Decide: re-search for a different release, or give up?
+      // downloadAttempts was incremented when this download started — it counts
+      // attempts already made (including this one).
+      const attemptsMade = request?.downloadAttempts ?? 0;
+      const exhausted = attemptsMade >= MAX_DOWNLOAD_ATTEMPTS;
+
+      if (exhausted) {
+        logger.error(`Download attempts exhausted (${attemptsMade}/${MAX_DOWNLOAD_ATTEMPTS}) for request ${requestId}, marking failed`);
+
+        await prisma.request.update({
+          where: { id: requestId },
+          data: {
+            status: 'failed',
+            errorMessage: `${errorMessage}. Gave up after ${attemptsMade} attempts.`,
+            updatedAt: new Date(),
+          },
+        });
+
+        if (request) {
+          const jobQueue = getJobQueueService();
+          await jobQueue.addNotificationJob(
+            'request_error',
+            request.id,
+            request.audiobook.title,
+            request.audiobook.author,
+            request.user.plexUsername || 'Unknown User',
+            errorMessage
+          ).catch((error) => {
+            logger.error('Failed to queue notification', { error: error instanceof Error ? error.message : String(error) });
+          });
+        }
+
+        return {
+          success: false,
+          completed: true,
+          message: 'Download failed permanently after max attempts',
+          requestId,
+          progress: progressPercent,
+        };
+      }
+
+      // Re-queue for search. retry-missing-torrents will pick this up and the
+      // search processor will filter out the just-blocklisted release, so the
+      // next ranked result is downloaded automatically.
+      logger.info(`Re-queueing request ${requestId} for search (attempt ${attemptsMade}/${MAX_DOWNLOAD_ATTEMPTS}, blocklisted release will be skipped)`);
+
+      await prisma.request.update({
+        where: { id: requestId },
+        data: {
+          status: 'awaiting_search',
+          errorMessage: `${errorMessage}. Release blocklisted, queued for re-search.`,
+          progress: 0,
+          updatedAt: new Date(),
+        },
+      });
 
       return {
         success: false,
         completed: true,
-        message: 'Download failed',
+        message: 'Download failed, release blocklisted and queued for re-search',
         requestId,
         progress: progressPercent,
       };

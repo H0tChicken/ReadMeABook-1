@@ -156,7 +156,8 @@ describe('processMonitorDownload', () => {
     );
   });
 
-  it('marks request failed when download fails', async () => {
+  it('blocklists release and re-queues for search when download fails (attempts remaining)', async () => {
+    const deleteDownload = vi.fn().mockResolvedValue(undefined);
     const qbtClientMock = {
       clientType: 'qbittorrent',
       protocol: 'torrent',
@@ -170,16 +171,27 @@ describe('processMonitorDownload', () => {
         downloadSpeed: 0,
         eta: 0,
         category: 'readmeabook',
+        errorMessage: 'Repair failed, not enough repair blocks',
       }),
+      deleteDownload,
     };
     downloadClientManagerMock.getClientServiceForProtocol.mockResolvedValue(qbtClientMock);
     prismaMock.request.update.mockResolvedValue({});
     prismaMock.downloadHistory.update.mockResolvedValue({});
+    prismaMock.downloadHistory.findUnique.mockResolvedValue({
+      torrentName: 'Book.Author.2024.MP3',
+      indexerName: 'NZBFinder',
+      indexerId: 7,
+    });
     prismaMock.request.findUnique.mockResolvedValue({
       id: 'req-3',
+      audiobookId: 'a-3',
+      downloadAttempts: 1,
       audiobook: { title: 'Book', author: 'Author' },
       user: { plexUsername: 'user' },
     });
+    prismaMock.blockedRelease.findFirst.mockResolvedValue(null);
+    prismaMock.blockedRelease.create.mockResolvedValue({});
 
     const { processMonitorDownload } = await import('@/lib/processors/monitor-download.processor');
     const result = await processMonitorDownload({
@@ -191,11 +203,144 @@ describe('processMonitorDownload', () => {
     });
 
     expect(result.success).toBe(false);
+    expect(deleteDownload).toHaveBeenCalledWith('hash-3', true);
+    expect(prismaMock.blockedRelease.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          requestId: 'req-3',
+          audiobookId: 'a-3',
+          releaseName: 'Book.Author.2024.MP3',
+          indexerName: 'NZBFinder',
+          indexerId: 7,
+        }),
+      })
+    );
+    // Download history is deselected and marked failed
+    expect(prismaMock.downloadHistory.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          downloadStatus: 'failed',
+          selected: false,
+        }),
+      })
+    );
+    // Request is re-queued for search, not marked permanently failed
+    expect(prismaMock.request.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'awaiting_search' }),
+      })
+    );
+    expect(prismaMock.request.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'failed' }),
+      })
+    );
+    // No notification while still retrying
+    expect(jobQueueMock.addNotificationJob).not.toHaveBeenCalled();
+  });
+
+  it('marks request permanently failed when download attempts are exhausted', async () => {
+    const sabClientMock = {
+      clientType: 'sabnzbd',
+      protocol: 'usenet',
+      getDownload: vi.fn().mockResolvedValue({
+        id: 'nzb-fail',
+        name: 'Book',
+        size: 0,
+        bytesDownloaded: 0,
+        progress: 0.5,
+        status: 'failed',
+        downloadSpeed: 0,
+        eta: 0,
+        category: 'readmeabook',
+        errorMessage: 'Aborted',
+      }),
+      deleteDownload: vi.fn().mockResolvedValue(undefined),
+    };
+    downloadClientManagerMock.getClientServiceForProtocol.mockResolvedValue(sabClientMock);
+    prismaMock.request.update.mockResolvedValue({});
+    prismaMock.downloadHistory.update.mockResolvedValue({});
+    prismaMock.downloadHistory.findUnique.mockResolvedValue({
+      torrentName: 'Book.NZB',
+      indexerName: 'Indexer',
+      indexerId: 1,
+    });
+    prismaMock.request.findUnique.mockResolvedValue({
+      id: 'req-exhaust',
+      audiobookId: 'a-exhaust',
+      downloadAttempts: 5, // at the cap
+      audiobook: { title: 'Book', author: 'Author' },
+      user: { plexUsername: 'user' },
+    });
+    prismaMock.blockedRelease.findFirst.mockResolvedValue(null);
+    prismaMock.blockedRelease.create.mockResolvedValue({});
+
+    const { processMonitorDownload } = await import('@/lib/processors/monitor-download.processor');
+    const result = await processMonitorDownload({
+      requestId: 'req-exhaust',
+      downloadHistoryId: 'dh-exhaust',
+      downloadClientId: 'nzb-fail',
+      downloadClient: 'sabnzbd',
+      jobId: 'job-exhaust',
+    });
+
+    expect(result.completed).toBe(true);
+    expect(result.success).toBe(false);
+    // Permanently failed after exhausting attempts
     expect(prismaMock.request.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: 'failed' }),
       })
     );
+    // Notification only fires on permanent failure
+    expect(jobQueueMock.addNotificationJob).toHaveBeenCalled();
+  });
+
+  it('does not duplicate blocklist entry when release is already blocklisted', async () => {
+    const qbtClientMock = {
+      clientType: 'qbittorrent',
+      protocol: 'torrent',
+      getDownload: vi.fn().mockResolvedValue({
+        id: 'hash-dup',
+        name: 'Book',
+        size: 0,
+        bytesDownloaded: 0,
+        progress: 0.1,
+        status: 'failed',
+        downloadSpeed: 0,
+        eta: 0,
+        category: 'readmeabook',
+      }),
+      deleteDownload: vi.fn().mockResolvedValue(undefined),
+    };
+    downloadClientManagerMock.getClientServiceForProtocol.mockResolvedValue(qbtClientMock);
+    prismaMock.request.update.mockResolvedValue({});
+    prismaMock.downloadHistory.update.mockResolvedValue({});
+    prismaMock.downloadHistory.findUnique.mockResolvedValue({
+      torrentName: 'Book.Already.Blocked',
+      indexerName: 'Indexer',
+      indexerId: 1,
+    });
+    prismaMock.request.findUnique.mockResolvedValue({
+      id: 'req-dup',
+      audiobookId: 'a-dup',
+      downloadAttempts: 2,
+      audiobook: { title: 'Book', author: 'Author' },
+      user: { plexUsername: 'user' },
+    });
+    // Already blocklisted
+    prismaMock.blockedRelease.findFirst.mockResolvedValue({ id: 'existing-block' });
+
+    const { processMonitorDownload } = await import('@/lib/processors/monitor-download.processor');
+    await processMonitorDownload({
+      requestId: 'req-dup',
+      downloadHistoryId: 'dh-dup',
+      downloadClientId: 'hash-dup',
+      downloadClient: 'qbittorrent',
+      jobId: 'job-dup',
+    });
+
+    expect(prismaMock.blockedRelease.create).not.toHaveBeenCalled();
   });
 
   it('handles SABnzbd completion and queues organize job', async () => {

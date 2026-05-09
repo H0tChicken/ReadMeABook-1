@@ -37,6 +37,7 @@ describe('processSearchIndexers', () => {
     vi.clearAllMocks();
     prismaMock.blockedRelease.findMany.mockResolvedValue([]);
     configMock.getAudibleRegion.mockResolvedValue('us');
+    jobQueueMock.addNotificationJob.mockResolvedValue(undefined);
   });
 
   it('marks request awaiting_search when no results found', async () => {
@@ -103,6 +104,81 @@ describe('processSearchIndexers', () => {
       'req-2',
       { id: 'a2', title: 'Book', author: 'Author' },
       expect.objectContaining({ title: 'Book - Author' })
+    );
+  });
+
+  it('marks request failed when MAX_SEARCH_ATTEMPTS is reached', async () => {
+    prismaMock.request.findUnique.mockResolvedValueOnce({ searchAttempts: 20 });
+    prismaMock.request.update.mockResolvedValue({});
+    prismaMock.request.findUnique.mockResolvedValueOnce({
+      id: 'req-cap',
+      audiobook: { title: 'Book', author: 'Author' },
+      user: { plexUsername: 'user' },
+    });
+
+    const { processSearchIndexers } = await import('@/lib/processors/search-indexers.processor');
+    const result = await processSearchIndexers({
+      requestId: 'req-cap',
+      audiobook: { id: 'a-cap', title: 'Book', author: 'Author' },
+      jobId: 'job-cap',
+    });
+
+    expect(result.success).toBe(false);
+    expect(prismaMock.request.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'failed' }),
+      })
+    );
+    expect(jobQueueMock.addNotificationJob).toHaveBeenCalled();
+    // Search should NOT have been performed
+    expect(prowlarrMock.searchWithVariations).not.toHaveBeenCalled();
+  });
+
+  it('filters blocklisted releases by normalized name (cosmetic variations)', async () => {
+    configMock.get.mockImplementation(async (key: string) => {
+      if (key === 'prowlarr_indexers') {
+        return JSON.stringify([{ id: 1, name: 'Indexer', protocol: 'torrent', priority: 10, categories: [3030] }]);
+      }
+      if (key === 'indexer_flag_config') return JSON.stringify([]);
+      return null;
+    });
+
+    // Blocklist stores original release name with separators/extension
+    prismaMock.blockedRelease.findMany.mockResolvedValue([
+      { releaseName: 'Book.Title.2024.MP3' },
+    ]);
+
+    // Indexer returns the same release with cosmetic variations
+    prowlarrMock.searchWithVariations.mockResolvedValue([
+      {
+        indexer: 'Indexer',
+        indexerId: 1,
+        title: 'Book Title (2024) [mp3]', // different separators / case / parens
+        size: 50 * 1024 * 1024,
+        seeders: 10,
+        publishDate: new Date(),
+        downloadUrl: 'magnet:?xt=urn:btih:abc',
+        guid: 'guid-x',
+        format: 'M4B',
+      },
+    ]);
+
+    prismaMock.request.update.mockResolvedValue({});
+
+    const { processSearchIndexers } = await import('@/lib/processors/search-indexers.processor');
+    const result = await processSearchIndexers({
+      requestId: 'req-norm',
+      audiobook: { id: 'a-norm', title: 'Book Title', author: 'Author' },
+      jobId: 'job-norm',
+    });
+
+    // The cosmetically-different release should be filtered → no quality matches → awaiting_search
+    expect(result.success).toBe(false);
+    expect(jobQueueMock.addDownloadJob).not.toHaveBeenCalled();
+    expect(prismaMock.request.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'awaiting_search' }),
+      })
     );
   });
 

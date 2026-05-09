@@ -240,12 +240,17 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
       },
     });
 
-    // Update request to downloaded (green status, waiting for Plex scan)
+    // Update request to downloaded (green status, waiting for Plex scan).
+    // Reset attempt counters: this request reached a successful end state, so
+    // any future manual retry / re-search starts from a clean slate rather
+    // than inheriting accumulated attempts from prior failures.
     await prisma.request.update({
       where: { id: requestId },
       data: {
         status: 'downloaded',
         progress: 100,
+        searchAttempts: 0,
+        downloadAttempts: 0,
         completedAt: new Date(),
         updatedAt: new Date(),
       },
